@@ -2,38 +2,55 @@
 
 namespace App\Services;
 
+use App\Services\Strategies\AuthStrategyInterface;
+use App\Services\Strategies\TokenStorageInterface;
+use App\Services\Strategies\SicoobAuthStrategy;
+use App\Services\Strategies\DatabaseTokenStorage;
 use Carbon\Carbon;
 
 class SicoobService
 {
-    private $sicoobRootPath = "https://api.sisbr.com.br/";
-    private $basicToken;
-    private $callbackURI;
-    private $clientID;
-    private $versaoHash = "3";
-    private $contaCorrente;
-    private $cooperativa;
-    private $chaveAcesso;
-    private $clientSecret;
-    private $numeroContrato;
-    private $password;
+    private AuthStrategyInterface $authStrategy;
+    private TokenStorageInterface $tokenStorage;
+    private string $contaCorrente;
+    private string $cooperativa;
+    private string $chaveAcesso;
+    private string $numeroContrato;
+    private string $password;
 
     /**
      * Construtor da classe SicoobService
      * 
      * @param array $config Configurações do SICOOB (opcional, usa variáveis de ambiente como fallback)
+     * @param AuthStrategyInterface|null $authStrategy Estratégia de autenticação (opcional)
+     * @param TokenStorageInterface|null $tokenStorage Estratégia de armazenamento de tokens (opcional)
      */
-    public function __construct(array $config = [])
-    {
-        $this->basicToken = $config['basic_token'] ?? getenv('SICOOB_BASIC_TOKEN');
-        $this->callbackURI = $config['callback_uri'] ?? getenv('SICOOB_CALLBACK_URI');
-        $this->clientID = $config['client_id'] ?? getenv('SICOOB_CLIENT_ID');
-        $this->clientSecret = $config['client_secret'] ?? getenv('SICOOB_CLIENT_SECRET');
+    public function __construct(
+        array $config = [],
+        ?AuthStrategyInterface $authStrategy = null,
+        ?TokenStorageInterface $tokenStorage = null
+    ) {
+        // Configurações básicas da conta
         $this->contaCorrente = $config['conta_corrente'] ?? getenv('SICOOB_CONTA_CORRENTE');
         $this->cooperativa = $config['cooperativa'] ?? getenv('SICOOB_COOPERATIVA');
         $this->chaveAcesso = $config['chave_acesso'] ?? getenv('SICOOB_CHAVE_ACESSO');
         $this->numeroContrato = $config['numero_contrato'] ?? getenv('SICOOB_NUMERO_CONTRATO');
         $this->password = $config['password'] ?? getenv('SICOOB_PASSWORD');
+
+        // Injeta estratégia de autenticação ou cria padrão
+        $this->authStrategy = $authStrategy ?? new SicoobAuthStrategy([
+            'basic_token' => $config['basic_token'] ?? getenv('SICOOB_BASIC_TOKEN'),
+            'client_id' => $config['client_id'] ?? getenv('SICOOB_CLIENT_ID'),
+            'client_secret' => $config['client_secret'] ?? getenv('SICOOB_CLIENT_SECRET'),
+            'callback_uri' => $config['callback_uri'] ?? getenv('SICOOB_CALLBACK_URI'),
+            'password' => $this->password,
+            'chave_acesso' => $this->chaveAcesso,
+            'cooperativa' => $this->cooperativa,
+            'conta_corrente' => $this->contaCorrente
+        ]);
+
+        // Injeta estratégia de armazenamento ou cria padrão (Database)
+        $this->tokenStorage = $tokenStorage ?? new DatabaseTokenStorage();
     }
 
     /**
@@ -60,12 +77,50 @@ class SicoobService
     private function normalizePropertyName(string $key): string
     {
         return str_replace(
-            ['basic_token', 'callback_uri', 'client_id', 'client_secret', 
-             'conta_corrente', 'chave_acesso', 'numero_contrato'],
-            ['basicToken', 'callbackURI', 'clientID', 'clientSecret',
-             'contaCorrente', 'chaveAcesso', 'numeroContrato'], 
+            ['conta_corrente', 'chave_acesso', 'numero_contrato'],
+            ['contaCorrente', 'chaveAcesso', 'numeroContrato'], 
             $key
         );
+    }
+
+    /**
+     * Obtém a estratégia de autenticação atual
+     * 
+     * @return AuthStrategyInterface
+     */
+    public function getAuthStrategy(): AuthStrategyInterface
+    {
+        return $this->authStrategy;
+    }
+
+    /**
+     * Define uma nova estratégia de autenticação
+     * 
+     * @param AuthStrategyInterface $authStrategy Nova estratégia
+     */
+    public function setAuthStrategy(AuthStrategyInterface $authStrategy): void
+    {
+        $this->authStrategy = $authStrategy;
+    }
+
+    /**
+     * Obtém a estratégia de armazenamento de tokens atual
+     * 
+     * @return TokenStorageInterface
+     */
+    public function getTokenStorage(): TokenStorageInterface
+    {
+        return $this->tokenStorage;
+    }
+
+    /**
+     * Define uma nova estratégia de armazenamento de tokens
+     * 
+     * @param TokenStorageInterface $tokenStorage Nova estratégia
+     */
+    public function setTokenStorage(TokenStorageInterface $tokenStorage): void
+    {
+        $this->tokenStorage = $tokenStorage;
     }
 
     /**
@@ -103,24 +158,13 @@ class SicoobService
     /**
      * Gera código de autorização OAuth2
      * 
-     * @param string $scope Escopo de permissões
+     * @param array $credentials Credenciais opcionais (sobrescreve as do construtor)
      * @return string Código de autorização
      * @throws \Exception Em caso de erro na geração
      */
-    public function generateAuthorizationCode(string $scope = ''): string
+    public function generateAuthorizationCode(array $credentials = []): string
     {
-        $scope = 'cobranca_boletos_consultar%20cobranca_boletos_pagador%20cobranca_boletos_incluir';
-        $endpoint = "auth/oauth2/authorize?password={$this->password}&response_type=code&chaveAcesso={$this->chaveAcesso}&cooperativa={$this->cooperativa}&contaCorrente={$this->contaCorrente}&redirect_uri={$this->callbackURI}&client_id={$this->clientID}&versaoHash={$this->versaoHash}&scope=$scope";
-        
-        $response = json_decode($this->makeRequest($endpoint, [
-            "postData" => "grant_type=authorization_code&code=code&redirect_uri={$this->callbackURI}"
-        ]), true);
-        
-        if (!isset($response['code'])) {
-            throw new \Exception('Erro ao gerar código de autorização: ' . ($response['error_description'] ?? 'Resposta inválida da API'));
-        }
-        
-        return $response['code'];
+        return $this->authStrategy->getAuthorizationCode($credentials);
     }
 
     /**
@@ -128,85 +172,27 @@ class SicoobService
      * 
      * @param string $scope Escopo de permissões
      * @param bool $forceRefreshToken Força renovação do token
-     * @param callable|null $tokenStorageCallback Callback para armazenamento de tokens (opcional)
      * @return array Objeto do token
      * @throws \Exception Em caso de erro na geração/renovação
      */
-    public function generateAccessTokenObject(string $scope, bool $forceRefreshToken = false, ?callable $tokenStorageCallback = null): array
+    public function generateAccessTokenObject(string $scope, bool $forceRefreshToken = false): array
     {
-        $ultimoToken = null;
-        
-        // Tenta obter token via callback
-        if ($tokenStorageCallback) {
-            $ultimoToken = $tokenStorageCallback('get');
-        } elseif (class_exists('\DB')) {
-            // Fallback para Laravel DB
-            try {
-                $ultimoToken = \DB::table('tokens')
-                    ->select('*')
-                    ->where('owner', '=', 'sicoob')
-                    ->whereNotNull('access_token')
-                    ->whereNotNull('refresh_token')
-                    ->orderBy('id', 'desc')
-                    ->first();
-            } catch (\Exception $e) {
-                // DB não disponível ou tabela não existe
-            }
-        }
+        $ultimoToken = $this->tokenStorage->getToken();
 
         if (!$ultimoToken) {
             throw new \Exception('Nenhum token válido encontrado. É necessário gerar um novo código de autorização.');
         }
 
-        $vencimentoDoToken = Carbon::parse($ultimoToken->created_at)->addSeconds($ultimoToken->expires_in);
-        
-        if (Carbon::now()->lessThan($vencimentoDoToken) && !$forceRefreshToken) {
-            return (array)$ultimoToken;
+        if ($this->tokenStorage->isTokenValid($ultimoToken) && !$forceRefreshToken) {
+            return $ultimoToken;
         } else {
-            $refreshToken = $ultimoToken->refresh_token;
-            $endpoint = "auth/token?grant_type=refresh_token&refresh_token=$refreshToken&client_id={$this->clientID}&client_secret={$this->clientSecret}";
-            $headers = [
-                "Content-Type: application/x-www-form-urlencoded",
-                "Authorization: Basic {$this->basicToken}",
-            ];
+            // Renova o token usando a estratégia de autenticação
+            $newToken = $this->authStrategy->refreshToken($ultimoToken['refresh_token']);
             
-            $responseData = $this->makeRequest($endpoint, ['requestType' => 'POST', 'headers' => $headers]);
-            $accessToken = json_decode($responseData, true);
-
-            if (isset($accessToken['access_token']) && isset($accessToken['refresh_token'])) {
-                $tokenData = [
-                    'access_token' => $accessToken['access_token'],
-                    'refresh_token' => $accessToken['refresh_token'],
-                    'scope' => $accessToken['scope'] ?? $scope,
-                    'type' => $accessToken['token_type'] ?? 'Bearer',
-                    'expires_in' => $accessToken['expires_in'] ?? 3600,
-                    'owner' => 'sicoob',
-                    'created_at' => Carbon::now()
-                ];
-
-                // Salva token via callback ou DB
-                if ($tokenStorageCallback) {
-                    $tokenStorageCallback('save', $tokenData);
-                } elseif (class_exists('\DB')) {
-                    try {
-                        \DB::table('tokens')->insert([
-                            'access_token' => $tokenData['access_token'],
-                            'refresh_token' => $tokenData['refresh_token'],
-                            'scope' => $tokenData['scope'],
-                            'type' => $tokenData['type'],
-                            'expires_in' => $tokenData['expires_in'],
-                            'owner' => 'sicoob',
-                            'created_at' => Carbon::now()
-                        ]);
-                    } catch (\Exception $e) {
-                        // Falha ao salvar no DB, mas continua com o token
-                    }
-                }
-            } else {
-                throw new \Exception('Erro ao renovar token: ' . ($accessToken['error_description'] ?? 'Resposta inválida da API'));
-            }
+            // Salva o novo token
+            $this->tokenStorage->saveToken($newToken);
             
-            return $accessToken;
+            return $newToken;
         }
     }
 
@@ -409,59 +395,26 @@ class SicoobService
      */
     public function makeRequest(string $endpoint, array $config = []): string
     {
-        $curl = curl_init();
+        // Delega a requisição para a estratégia de autenticação
+        // Nota: Este método é mantido para compatibilidade, mas o ideal é usar diretamente a estratégia
+        $reflection = new \ReflectionClass($this->authStrategy);
+        $method = $reflection->getMethod('makeRequest');
+        $method->setAccessible(true);
         
-        $options = [
-            CURLOPT_URL => $this->sicoobRootPath . $endpoint,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_ENCODING => "",
-            CURLOPT_MAXREDIRS => 10,
-            CURLOPT_TIMEOUT => 30,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
-            CURLOPT_CUSTOMREQUEST => $config['requestType'] ?? "GET",
-            CURLOPT_POSTFIELDS => $config["postData"] ?? "",
-            CURLOPT_HTTPHEADER => $this->normalizeHeaders($config['headers'] ?? []),
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_SSL_VERIFYHOST => 2,
-        ];
-        
-        curl_setopt_array($curl, $options);
-        
-        $response = curl_exec($curl);
-        $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-        $error = curl_error($curl);
-        $errno = curl_errno($curl);
-        
-        curl_close($curl);
-        
-        if ($errno !== CURLE_OK) {
-            throw new \Exception("Erro na requisição cURL: $error (código: $errno)");
-        }
-        
-        if ($httpCode >= 400) {
-            throw new \Exception("Erro na requisição HTTP: Status $httpCode. Resposta: $response");
-        }
-        
-        return $response;
+        // Adiciona o endpoint completo usando a URL base da estratégia
+        return $method->invoke($this->authStrategy, $endpoint, $config);
     }
 
     /**
-     * Normaliza headers para formato esperado pelo cURL
+     * Define a URL base da API (para compatibilidade)
      * 
-     * @param array $headers Headers
-     * @return array Headers normalizados
+     * @param string $url URL base
      */
-    private function normalizeHeaders(array $headers): array
+    public function setBaseUrl(string $url): void
     {
-        $normalized = [];
-        foreach ($headers as $key => $value) {
-            if (is_numeric($key)) {
-                $normalized[] = $value;
-            } else {
-                $normalized[] = "$key: $value";
-            }
-        }
-        return $normalized;
+        $reflection = new \ReflectionClass($this->authStrategy);
+        $property = $reflection->getProperty('baseUrl');
+        $property->setAccessible(true);
+        $property->setValue($this->authStrategy, $url);
     }
 }
